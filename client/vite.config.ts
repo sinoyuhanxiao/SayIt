@@ -28,7 +28,15 @@ export default defineConfig({
     __SAYIT_DEFAULT_SERVER_URL__: JSON.stringify(defaultServerUrl),
     __APP_VERSION__: JSON.stringify(appVersion),
   },
-  plugins: [react()],
+  plugins: [react(), ...(process.env.VITE_SAYIT_ASK_DEV === '1' ? [{
+    name: 'ask-dev-refresh',
+    // Recreate the recorder and its event subscriptions together when source changes.
+    // A component-only refresh can otherwise retain a disposed recorder singleton.
+    handleHotUpdate({ server }: { server: { ws: { send: (message: { type: 'full-reload' }) => void } } }) {
+      server.ws.send({ type: 'full-reload' })
+      return []
+    },
+  }] : [])],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
@@ -57,6 +65,7 @@ export default defineConfig({
       input: {
         main: path.resolve(__dirname, 'index.html'),
         overlay: path.resolve(__dirname, 'overlay.html'),
+        ask: path.resolve(__dirname, 'ask.html'),
         updateNotification: path.resolve(__dirname, 'update-notification.html'),
       },
     },
