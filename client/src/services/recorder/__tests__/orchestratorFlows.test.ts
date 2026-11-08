@@ -9,6 +9,9 @@
  * provider 收到了什么调用。拆分前后这些必须原样一致。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { requestAskText } from '../../askText'
+
+vi.mock('../../askText', () => ({ requestAskText: vi.fn(async () => 'Follow-up answer') }))
 
 type Handler = (payload?: unknown) => void
 
@@ -41,6 +44,9 @@ vi.mock('../../bridge', () => {
   const fn = () => vi.fn(() => Promise.resolve(undefined))
   return {
     presentOverlay: fn(),
+    syncAskWindow: fn(),
+    isAskWindowOpen: vi.fn(async () => false),
+    setAskRecording: fn(),
     showOverlay: fn(),
     hideOverlay: fn(),
     updateOverlay: fn(),
@@ -220,6 +226,8 @@ async function recordAndRelease(seconds = 2) {
 }
 
 beforeEach(() => {
+  vi.mocked(bridge.syncAskWindow).mockClear()
+  vi.mocked(bridge.isAskWindowOpen).mockReset().mockResolvedValue(false)
   for (const key of Object.keys(h.state.handlers)) delete h.state.handlers[key]
   store.history = []
   h.state.settings = {}
@@ -248,6 +256,245 @@ beforeEach(() => {
 afterEach(() => {
   orch?.cleanup()
   vi.useRealTimers()
+})
+
+describe('voice questions', () => {
+  async function askAndStop() {
+    vi.useFakeTimers()
+    h.state.settings['ask.enabled'] = true
+    await startedOrchestrator()
+    await orch.toggleAsk()
+    await flush()
+    expect(orch.getState()).toBe('recording')
+    feedAudio(2)
+    vi.advanceTimersByTime(300)
+    await orch.toggleAsk()
+    await flush()
+    expect(orch.getState()).toBe('processing')
+  }
+
+  it('answers with cleanup off, without pasting or writing dictation history', async () => {
+    h.state.settings = { aiEnabled: false, aiMinDurationSec: 60 }
+    await askAndStop()
+    expect(provider.start).toHaveBeenCalledWith(expect.objectContaining({
+      purpose: 'ask', disableAi: false, aiMinDurationSec: 0,
+      aiConfig: expect.objectContaining({ aiEnabled: true }),
+    }))
+    provider.callbacks!.onASR({ text: 'Why is the sky blue?', asrMs: 100, durationSec: 2 })
+    provider.callbacks!.onFinal(finalResult('Why is the sky blue?', {
+      llmText: 'Because air scatters blue light.', aiStatus: 'applied', aiSource: 'server',
+    }))
+    await flush(80)
+    expect(bridge.syncAskWindow).toHaveBeenLastCalledWith(expect.objectContaining({
+      status: 'done', question: 'Why is the sky blue?', answer: 'Because air scatters blue light.',
+    }))
+    expect(bridge.pasteText).not.toHaveBeenCalled()
+    expect(store.history).toHaveLength(0)
+    expect(orch.getState()).toBe('idle')
+  })
+
+  it('captures a read-only selection and sends no surrounding paragraphs', async () => {
+    vi.mocked(bridge.getRecordingContext).mockResolvedValueOnce({
+      appContext: { processName: 'browser.exe', textContext: {
+        source: 'text_pattern', textBefore: 'private prefix', textAfter: 'private suffix',
+        selectedText: 'The highlighted passage', selectionTruncated: false,
+      } }, probe: { ...h.state.probe, editable: false },
+    } as never)
+    await askAndStop()
+    expect(bridge.getRecordingContext).toHaveBeenLastCalledWith(true, true)
+    expect(provider.start).toHaveBeenLastCalledWith(expect.objectContaining({
+      textContext: expect.objectContaining({ selectedText: 'The highlighted passage', textBefore: '', textAfter: '' }),
+      systemPrompt: expect.stringContaining('question-answering assistant'),
+    }))
+    provider.callbacks!.onFinal(finalResult('Explain this', { llmText: 'An explanation', aiStatus: 'applied' }))
+    await flush(80)
+    expect(bridge.pasteText).not.toHaveBeenCalled()
+  })
+
+  it('does not mistake an AI failure fallback for an answer', async () => {
+    await askAndStop()
+    provider.callbacks!.onFinal(finalResult('A question', { aiStatus: 'failed' }))
+    await flush(80)
+    expect(bridge.syncAskWindow).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'error', answer: '' }))
+    expect(bridge.pasteText).not.toHaveBeenCalled()
+  })
+
+  it('accepts a single-Alt stop only for the current question recording', async () => {
+    const listeners: Record<string, (event: unknown) => void> = {}
+    vi.mocked(bridge.listen).mockImplementation(async (name, callback) => {
+      listeners[name] = callback as (event: unknown) => void
+      return () => {}
+    })
+    h.state.settings['ask.enabled'] = true
+    await startedOrchestrator()
+    await orch.toggleAsk()
+    await flush(80)
+    const runId = (provider.start.mock.calls[0][0] as { runId: number }).runId
+    expect(bridge.setAskRecording).toHaveBeenCalledWith(runId, true)
+    feedAudio(2)
+    listeners['stop-ask-recording']({ payload: { runId: runId + 1 } })
+    await flush()
+    expect(orch.getState()).toBe('recording')
+    listeners['stop-ask-recording']({ payload: { runId } })
+    await flush(80)
+    expect(orch.getState()).toBe('processing')
+    expect(bridge.setAskRecording).toHaveBeenCalledWith(runId, false)
+    provider.callbacks!.onFinal(finalResult('Question', { llmText: 'Answer', aiStatus: 'applied' }))
+    await flush(80)
+    expect(bridge.pasteText).not.toHaveBeenCalled()
+    emit('hands-free')
+    await flush(80)
+    expect(orch.getState()).toBe('recording')
+    listeners['stop-ask-recording']({ payload: { runId } })
+    await flush()
+    expect(orch.getState()).toBe('recording')
+  })
+
+  it('continues by voice using the original selection and previous answer', async () => {
+    vi.mocked(bridge.getRecordingContext).mockResolvedValueOnce({
+      appContext: { textContext: { source: 'text_pattern', textBefore: '', textAfter: '', selectedText: 'Original passage', selectionTruncated: false } },
+      probe: h.state.probe,
+    } as never)
+    await askAndStop()
+    provider.callbacks!.onFinal(finalResult('Explain this', { llmText: 'An explanation', aiStatus: 'applied' }))
+    await flush(80)
+    vi.advanceTimersByTime(300)
+    await orch.toggleAsk(true)
+    await flush(80)
+    expect(provider.start).toHaveBeenLastCalledWith(expect.objectContaining({
+      textContext: expect.objectContaining({ selectedText: 'Original passage' }),
+      systemPrompt: expect.stringContaining('An explanation'),
+    }))
+    expect(bridge.getRecordingContext).toHaveBeenLastCalledWith(false)
+    expect(bridge.pasteText).not.toHaveBeenCalled()
+    expect(store.history).toHaveLength(0)
+  })
+
+  it('uses the global shortcut to continue whenever the question window remains open', async () => {
+    vi.mocked(bridge.getRecordingContext).mockResolvedValueOnce({
+      appContext: { textContext: { source: 'text_pattern', textBefore: '', textAfter: '', selectedText: 'Original passage', selectionTruncated: false } },
+      probe: h.state.probe,
+    } as never)
+    await askAndStop()
+    provider.callbacks!.onFinal(finalResult('Explain this', { llmText: 'The previous answer', aiStatus: 'applied' }))
+    await flush(80)
+    vi.mocked(bridge.isAskWindowOpen).mockResolvedValue(true)
+    vi.advanceTimersByTime(300)
+    // The foreground app need not be the question window; its new selection is irrelevant.
+    await orch.toggleAsk()
+    await flush(80)
+    expect(bridge.isAskWindowOpen).toHaveBeenCalledTimes(1)
+    expect(bridge.getRecordingContext).toHaveBeenLastCalledWith(false)
+    expect(provider.start).toHaveBeenLastCalledWith(expect.objectContaining({
+      textContext: expect.objectContaining({ selectedText: 'Original passage' }),
+      systemPrompt: expect.stringContaining('The previous answer'),
+    }))
+    expect(bridge.pasteText).not.toHaveBeenCalled()
+    expect(store.history).toHaveLength(0)
+  })
+
+  it('starts a fresh conversation with a newly captured selection after the window is closed', async () => {
+    await askAndStop()
+    provider.callbacks!.onFinal(finalResult('Old question', { llmText: 'Old answer', aiStatus: 'applied' }))
+    await flush(80)
+    vi.mocked(bridge.isAskWindowOpen).mockResolvedValue(false)
+    vi.mocked(bridge.getRecordingContext).mockResolvedValueOnce({
+      appContext: { textContext: { source: 'text_pattern', textBefore: '', textAfter: '', selectedText: 'New passage', selectionTruncated: false } },
+      probe: h.state.probe,
+    } as never)
+    vi.advanceTimersByTime(300)
+    await orch.toggleAsk()
+    await flush(80)
+    expect(bridge.getRecordingContext).toHaveBeenLastCalledWith(true, true)
+    const options = provider.start.mock.calls[provider.start.mock.calls.length - 1][0] as { systemPrompt: string }
+    expect(options.systemPrompt).not.toContain('Old answer')
+    expect(provider.start).toHaveBeenLastCalledWith(expect.objectContaining({
+      textContext: expect.objectContaining({ selectedText: 'New passage' }),
+    }))
+    expect(bridge.pasteText).not.toHaveBeenCalled()
+    expect(store.history).toHaveLength(0)
+  })
+
+  it('answers a typed follow-up without opening the microphone or inserting text', async () => {
+    const listeners: Record<string, (event: unknown) => void> = {}
+    vi.mocked(bridge.listen).mockImplementation(async (name, callback) => {
+      listeners[name] = callback as (event: unknown) => void
+      return () => {}
+    })
+    await askAndStop()
+    provider.callbacks!.onFinal(finalResult('Explain this', { llmText: 'An explanation', aiStatus: 'applied' }))
+    await flush(80)
+    const calls = vi.mocked(bridge.syncAskWindow).mock.calls
+    const snapshot = calls[calls.length - 1][0]
+    listeners['ask-action']({ payload: { action: 'followup', runId: snapshot.runId, question: 'Give an example' } })
+    await flush(80)
+    expect(requestAskText).toHaveBeenCalledWith('Give an example', expect.stringContaining('An explanation'), '')
+    expect(provider.start).toHaveBeenCalledTimes(1)
+    expect(bridge.syncAskWindow).toHaveBeenLastCalledWith(expect.objectContaining({
+      status: 'done', answer: 'Follow-up answer', turns: [{ question: 'Explain this', answer: 'An explanation' }],
+    }))
+    expect(bridge.pasteText).not.toHaveBeenCalled()
+    expect(store.history).toHaveLength(0)
+  })
+
+  it('cancels processing with Escape and ignores a late answer', async () => {
+    await askAndStop()
+    const runId = (provider.start.mock.calls[provider.start.mock.calls.length - 1][0] as { runId: number }).runId
+    emit('escape', { mode: 'cancel_processing', token: runId })
+    await flush(80)
+    provider.callbacks!.onFinal(finalResult('Question', { llmText: 'Late answer', aiStatus: 'applied' }))
+    await flush(80)
+    expect(bridge.syncAskWindow).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'cancelled' }))
+    expect(bridge.pasteText).not.toHaveBeenCalled()
+    expect(store.history).toHaveLength(0)
+  })
+
+  it('times out without late insertion or recording history', async () => {
+    await askAndStop()
+    vi.advanceTimersByTime(90_001)
+    await flush(80)
+    provider.callbacks!.onFinal(finalResult('Question', { llmText: 'Late answer', aiStatus: 'applied' }))
+    await flush(80)
+    expect(bridge.syncAskWindow).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'error' }))
+    expect(orch.getState()).toBe('idle')
+    expect(bridge.pasteText).not.toHaveBeenCalled()
+    expect(store.history).toHaveLength(0)
+  })
+
+  it('does not start a second microphone session during ordinary dictation', async () => {
+    h.state.settings['ask.enabled'] = true
+    await startedOrchestrator()
+    emit('ptt-down')
+    await flush()
+    await orch.toggleAsk()
+    expect(provider.start).toHaveBeenCalledTimes(1)
+    expect(bridge.syncAskWindow).not.toHaveBeenCalled()
+  })
+
+  it('leaves the feature inactive by default', async () => {
+    await startedOrchestrator()
+    await orch.toggleAsk()
+    expect(provider.start).not.toHaveBeenCalled()
+    expect(bridge.syncAskWindow).not.toHaveBeenCalled()
+    expect(orch.getState()).toBe('idle')
+  })
+
+  it('returns to normal dictation and its original AI settings after answering', async () => {
+    h.state.settings = { aiEnabled: false, aiMinDurationSec: 60 }
+    await askAndStop()
+    provider.callbacks!.onFinal(finalResult('Question', { llmText: 'An answer', aiStatus: 'applied' }))
+    await flush(80)
+    await recordAndRelease()
+    expect(provider.start).toHaveBeenLastCalledWith(expect.objectContaining({
+      disableAi: true, aiMinDurationSec: 60,
+    }))
+    expect(provider.start.mock.calls[provider.start.mock.calls.length - 1][0]).not.toHaveProperty('purpose')
+    provider.callbacks!.onFinal(finalResult('Ordinary dictation'))
+    await flush(80)
+    expect(bridge.pasteText).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(bridge.pasteText).mock.calls[0][0]).toBe('Ordinary dictation')
+    expect(store.history).toHaveLength(1)
+  })
 })
 
 describe('RecorderOrchestrator 主路径', () => {
