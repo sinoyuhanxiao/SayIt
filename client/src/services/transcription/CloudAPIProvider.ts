@@ -611,7 +611,7 @@ export class CloudAPIProvider implements TranscriptionProvider {
 
       // 与其它模式共用同一份判据。isQwenOmni 走 integrated_asr 路由：它表达的是
       // "识别引擎自带整理，没有另外调独立 AI"，而不是"用户的预设已经执行过"。
-      const policy = policyFromSnapshot(startOpts.aiConfig, 'cloud_api', durationSec, isQwenOmni)
+      const policy = policyFromSnapshot(startOpts.aiConfig, 'cloud_api', durationSec, isQwenOmni && startOpts.purpose !== 'ask')
       const outcomeContext: AiOutcomeContext = {
         operationId: startOpts.operationId || `cloud-${runId}`,
         trigger: startOpts.source === 'history_reprocess' ? 'history_reprocess' : 'live',
