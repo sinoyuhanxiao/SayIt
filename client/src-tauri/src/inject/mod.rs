@@ -19,6 +19,81 @@ use std::time::Instant;
 #[cfg(windows)]
 static PASTE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// Explicit question selections only. UIA cannot expose selections in some Chromium/terminal
+/// views, so try the application's Copy command without changing focus or pasting anything.
+/// Clipboard restoration is conditional so a newer user copy is not overwritten.
+#[cfg(windows)]
+pub fn capture_question_selection(ctx: &mut crate::context::AppContext) {
+    if ctx.is_password || ctx.pid == std::process::id() || ctx.hwnd.is_empty()
+        || ctx.text_context.as_ref().is_some_and(|text| !text.selected_text.is_empty() || text.selection_truncated)
+    { return; }
+    // These editors copy an entire line when nothing is selected. Never treat that as a selection.
+    if matches!(ctx.process_name.to_ascii_lowercase().as_str(), "code.exe" | "cursor.exe" | "windsurf.exe") { return; }
+    let Ok(target_value) = ctx.hwnd.parse::<isize>() else { return; };
+    let terminal = ctx.window_class.eq_ignore_ascii_case("CASCADIA_HOSTING_WINDOW_CLASS");
+    let selection = unsafe { copy_question_selection(HWND(target_value as *mut _), terminal) };
+    if let Some(selected_text) = selection {
+        let truncated = selected_text.chars().count() > 6000;
+        ctx.text_context = Some(crate::context::TextContext {
+            source: "question_copy".into(),
+            selected_text: if truncated { String::new() } else { selected_text },
+            selection_truncated: truncated,
+            ..Default::default()
+        });
+    }
+    crate::commands::system::write_log_line(&format!(
+        "[ask-selection] source={} selectedChars={} truncated={}",
+        ctx.text_context.as_ref().map(|text| text.source.as_str()).unwrap_or("none"),
+        ctx.text_context.as_ref().map(|text| text.selected_text.chars().count()).unwrap_or(0),
+        ctx.text_context.as_ref().is_some_and(|text| text.selection_truncated),
+    ));
+}
+
+#[cfg(windows)]
+unsafe fn copy_question_selection(target: HWND, terminal: bool) -> Option<String> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    use windows::Win32::System::DataExchange::GetClipboardSequenceNumber;
+    // Do not synthesize Ctrl+C while the initiating Alt+Space modifiers are still held.
+    let started = Instant::now();
+    while [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C].iter().any(|key| GetAsyncKeyState(*key) < 0) {
+        if started.elapsed().as_millis() > 1200 || GetForegroundWindow() != target { return None; }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    if GetForegroundWindow() != target { return None; }
+    let generation = PASTE_GENERATION.load(Ordering::SeqCst);
+    let snapshot = snapshot_clipboard(generation)?;
+    let marker = format!("sayit-selection-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    if !set_clipboard_with_retry(&marker, 3, 15) { return None; }
+    let sequence = GetClipboardSequenceNumber();
+    let mut keys = vec![make_key_input(VIRTUAL_KEY(0xA2), KEYBD_EVENT_FLAGS(0))];
+    // Windows Terminal's explicit Copy is Ctrl+Shift+C; never send a possible Ctrl+C interrupt.
+    if terminal { keys.push(make_key_input(VIRTUAL_KEY(0xA0), KEYBD_EVENT_FLAGS(0))); }
+    keys.push(make_key_input(VIRTUAL_KEY(0x43), KEYBD_EVENT_FLAGS(0)));
+    keys.push(make_key_input(VIRTUAL_KEY(0x43), KEYEVENTF_KEYUP));
+    if terminal { keys.push(make_key_input(VIRTUAL_KEY(0xA0), KEYEVENTF_KEYUP)); }
+    keys.push(make_key_input(VIRTUAL_KEY(0xA2), KEYEVENTF_KEYUP));
+    let mut result = None;
+    if GetForegroundWindow() == target && SendInput(&keys, std::mem::size_of::<INPUT>() as i32) == keys.len() as u32 {
+        let copied = Instant::now();
+        while copied.elapsed().as_millis() < 700 {
+            if GetForegroundWindow() != target || PASTE_GENERATION.load(Ordering::SeqCst) != generation { break; }
+            if GetClipboardSequenceNumber() != sequence {
+                result = native_get_clipboard_text().filter(|text| text != &marker && !text.trim().is_empty());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+    }
+    // Restore only while the clipboard still contains this operation's marker/copied result.
+    let current = native_get_clipboard_text();
+    if PASTE_GENERATION.load(Ordering::SeqCst) == generation
+        && (current.as_deref() == Some(marker.as_str()) || (result.is_some() && current == result)) {
+        if snapshot.formats.is_empty() { let _ = native_clear_clipboard(); }
+        else { let _ = restore_clipboard_snapshot(&snapshot, 3, 20); }
+    }
+    result
+}
+
 #[cfg(windows)]
 struct ClipboardRestoreGuard {
     enabled: bool,
