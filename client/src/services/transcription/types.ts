@@ -77,6 +77,7 @@ export interface TranscriptionCallbacks {
 }
 
 export interface StartOptions {
+  purpose?: 'dictation' | 'ask'
   /** 当前录音代次；取消或开始下一次后，旧代次的异步结果必须全部丢弃。 */
   runId: number
   /** 本次处理的日志关联标识。历史重跑必须新建，不能复用被重跑那条记录的旧标识。 */
