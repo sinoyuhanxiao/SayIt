@@ -6,11 +6,15 @@ let orchestrator = new RecorderOrchestrator()
 
 // HMR cleanup: dispose old orchestrator when module is hot-replaced
 if ((import.meta as unknown as Record<string, unknown>).hot) {
-  const hot = (import.meta as unknown as Record<string, unknown>).hot as { dispose: (cb: () => void) => void }
+  const hot = (import.meta as unknown as Record<string, unknown>).hot as {
+    dispose: (cb: () => void) => void
+    on?: (event: string, cb: () => void) => void
+  }
   hot.dispose(() => {
     console.log('[recorder] HMR dispose: cleaning up old orchestrator')
     orchestrator.cleanup()
   })
+  hot.on?.('vite:beforeFullReload', () => orchestrator.cleanup())
 }
 
 export function setStateListener(cb: (s: RecorderState) => void) {
