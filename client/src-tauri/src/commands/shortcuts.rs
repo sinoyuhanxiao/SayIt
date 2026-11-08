@@ -143,6 +143,30 @@ pub fn register_all_global_shortcuts(app: &AppHandle, storage: &Storage) {
         }
     }
 
+    // Existing bindings always have priority. A question shortcut must never replace them.
+    let ask_value = storage.get("shortcutAsk", None);
+    let default_ask = if cfg!(target_os = "macos") { "Control+Alt+Space" } else { "Alt+Space" };
+    let ask_enabled = storage.get("ask.enabled", None).as_bool().unwrap_or(false);
+    let ask_key = if ask_enabled { ask_value.as_str().unwrap_or(default_ask) } else { "" };
+    let ask_error = if ask_key.is_empty() {
+        false
+    } else if gs.is_registered(ask_key) {
+        true
+    } else {
+        match gs.on_shortcut(ask_key, |app, _, event| {
+            if event.state == ShortcutState::Pressed {
+                let _ = app.emit_to("main", "toggle-ask", ());
+            }
+        }) {
+            Ok(_) => false,
+            Err(error) => {
+                log::warn!("Could not register question shortcut: {}", error);
+                true
+            }
+        }
+    };
+    let _ = storage.set("ask.shortcutConflict", &serde_json::json!(ask_error));
+
     #[cfg(target_os = "macos")]
     crate::keyboard::set_tap_combos(tap_combos);
 }
