@@ -272,8 +272,9 @@ export function PTTShortcutInput({
 export async function checkShortcutBeforeCommit(
   value: string,
   validate?: ShortcutValidate,
+  allowAltSpace = false,
 ): Promise<string | null> {
-  const systemError = getAcceleratorShortcutValidationError(value)
+  const systemError = allowAltSpace && value === 'Alt+Space' ? null : getAcceleratorShortcutValidationError(value)
   if (systemError) return systemError
   const error = validate ? await validate(value) : null
   if (error) return error
@@ -292,6 +293,7 @@ export function ComboShortcutInput({
   comboOnly = false,
   allowMouseShortcut = false,
   allowClear = true,
+  allowAltSpace = false,
   validate,
 }: {
   value: string
@@ -309,6 +311,7 @@ export function ComboShortcutInput({
    * 一个把免提功能清成"未设置"的按钮在这里只会制造问题。设置页保持可清空。
    */
   allowClear?: boolean
+  allowAltSpace?: boolean
   validate?: ShortcutValidate
 }) {
   const [recording, setRecording] = useState(false)
@@ -348,7 +351,7 @@ export function ComboShortcutInput({
     // 第二次会因为"自己刚注册"而误报冲突）
     committingRef.current = true
     void (async () => {
-      const error = await checkShortcutBeforeCommit(tempValue, validate)
+      const error = await checkShortcutBeforeCommit(tempValue, validate, allowAltSpace)
       if (error) {
         showConflict(error)
       } else {
@@ -358,7 +361,7 @@ export function ComboShortcutInput({
       setRecording(false)
       setTempValue('')
     })()
-  }, [cancelRecording, tempValue, onChange, comboOnly, validate, showConflict])
+  }, [cancelRecording, tempValue, onChange, comboOnly, validate, showConflict, allowAltSpace])
 
   useEffect(() => {
     if (!recording) return
