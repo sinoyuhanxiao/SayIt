@@ -250,6 +250,7 @@ async function runCheckAndDownload(): Promise<void> {
  * 在 App.tsx 挂载时调用一次。
  */
 export async function startUpdateService(): Promise<void> {
+  if (import.meta.env.VITE_SAYIT_ASK_DEV === '1') return
   // 整个函数包一层：调用方是 `void startUpdateService()`，没有 catch，
   // 这里任何一处抛异常都会被 Promise 静默吞掉，表现成"更新功能毫无反应"。
   try {
@@ -307,6 +308,7 @@ export async function startUpdateService(): Promise<void> {
  * 发现新版本同样会在后台开始下载 —— 与自动路径同一套行为，不再是"检查完直接装掉"。
  */
 export async function checkForUpdateNow(): Promise<VersionInfo | null> {
+  if (import.meta.env.VITE_SAYIT_ASK_DEV === '1') return null
   await runCheckAndDownload()
   return currentState.versionInfo ?? null
 }
