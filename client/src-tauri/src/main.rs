@@ -671,6 +671,7 @@ fn main() {
         .manage(keyboard_hook)
         .manage(context_detector)
         .manage(commands::update_notification::UpdateNotificationState::default())
+        .manage(commands::ask::AskWindowState::default())
         .setup(move |app| {
             // macOS：登录时要不要启动只由「登录时自动启动」决定，不让系统的「重新登录时重新打开窗口」
             // 把 SayIt 当普通应用不带参数地拉起来（那样主窗口会在登录后弹出来，见 appkit.rs）。
@@ -811,6 +812,10 @@ fn main() {
             Some(vec!["--minimized"]),
         ))
         .invoke_handler(tauri::generate_handler![
+            commands::ask::sync_ask_window,
+            commands::ask::get_ask_snapshot,
+            commands::ask::ask_window_action,
+            commands::ask::set_ask_recording,
             // Store
             commands::storage::store_get,
             commands::storage::store_set,
