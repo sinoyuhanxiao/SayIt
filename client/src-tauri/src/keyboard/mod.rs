@@ -38,6 +38,54 @@ static HOOK_RUNNING: AtomicBool = AtomicBool::new(false);
 /// reconfigure() 累计调用次数，用于确认"过一段时间失效"是否与设置变更相关。
 static RECONFIGURE_COUNT: AtomicU64 = AtomicU64::new(0);
 
+// Armed only for a voice-question recording; ordinary dictation never sets this token.
+static ASK_RECORDING_TOKEN: AtomicU64 = AtomicU64::new(0);
+pub fn set_ask_recording(token: u64, active: bool) {
+    if active {
+        ASK_RECORDING_TOKEN.fetch_max(token, Ordering::SeqCst);
+    } else {
+        let _ = ASK_RECORDING_TOKEN.compare_exchange(token, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
+#[derive(Default)]
+#[cfg_attr(not(windows), allow(dead_code))]
+struct AskAltLatch { down: bool, consumed: bool, space: bool }
+
+impl AskAltLatch {
+    // The Alt used to start Alt+Space must be released before a fresh press can stop it.
+    fn key(&mut self, vk: u32, down: bool, up: bool, token: u64, blocked: bool) -> (bool, bool) {
+        if vk == 0xA4 {
+            if up {
+                self.down = false;
+                let consumed = self.consumed;
+                self.consumed = false;
+                return (consumed, false);
+            }
+            if down {
+                let fresh = !self.down;
+                self.down = true;
+                if self.consumed { return (true, false); }
+                if fresh && token != 0 && !blocked {
+                    self.consumed = true;
+                    return (true, true);
+                }
+            }
+        }
+        // Also swallow Space if the user still presses the previous stop combination.
+        if vk == 0x20 && ((down && self.consumed) || (up && self.space)) {
+            self.space = down;
+            return (true, false);
+        }
+        (false, false)
+    }
+}
+
+#[cfg(windows)]
+thread_local! {
+    static ASK_ALT_LATCH: std::cell::RefCell<AskAltLatch> = std::cell::RefCell::new(AskAltLatch::default());
+}
+
 // ── "录制捕获"模式 ──
 // 设置页录制快捷键时，前端会打开这个开关。开启后：
 //  - 鼠标钩子把下一个侧键(XBUTTON)按下吞掉并回报，webview 不会当成“后退”导航；
@@ -732,6 +780,7 @@ enum HookAction {
     HfToggle { vk: u32 },
     AiToggle { vk: u32 },
     Escape { mode: u32, token: u64 },
+    AskStop { token: u64 },
     /// 悬浮窗卡片上的临时组合键（目前只有 Ctrl+C = 复制结果文本）。
     CardHotkey { action: u32, token: u64 },
     Diag { vk: u32, msg_name: &'static str, flags: u32, scan_code: u32 },
@@ -1452,6 +1501,9 @@ fn spawn_dispatcher(
                             "source": "rust_hook",
                             "vk": vk,
                         }));
+                    }
+                    HookAction::AskStop { token } => {
+                        let _ = dispatch_state.app_handle.emit_to("main", "stop-ask-recording", serde_json::json!({ "runId": token }));
                     }
                     HookAction::Escape { mode, token } => {
                         let mode_name = escape_action_mode_name(mode);
@@ -2210,6 +2262,26 @@ unsafe extern "system" fn low_level_keyboard_proc(
             return CallNextHookEx(None, n_code, w_param, l_param);
         }
 
+        if vk == 0xA4 || vk == 0x20 {
+            let token = ASK_RECORDING_TOKEN.load(Ordering::SeqCst);
+            let bound = HOOK_STATE.with(|s| s.borrow().as_ref().is_some_and(|state|
+                state.ptt_vk_codes.contains(&0xA4) || state.hf_vk_codes.contains(&0xA4)
+                    || state.ai_toggle_vk_codes.contains(&0xA4)));
+            let blocked = bound || (vk == 0xA4 && MODIFIER_VK_CODES.iter().any(|code|
+                *code != 0xA4 && windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(*code as i32) < 0));
+            let (consumed, stop) = ASK_ALT_LATCH.with(|latch| latch.borrow_mut().key(vk, is_kdown, is_kup, token, blocked));
+            if stop {
+                HOOK_ACTION_TX.with(|tx| {
+                    if let Some(sender) = tx.borrow().as_ref() {
+                        if sender.send(HookAction::AskStop { token }).is_err() {
+                            TRY_SEND_FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+            if consumed { return LRESULT(1); }
+        }
+
         // overlay 不聚焦，录音中/处理中/兜底卡片的 Esc 必须在这里全局捕获。
         // 只在前端短暂开启的模式下吞键；配对的 keyup 即使模式已被前端关闭也继续吞掉，
         // 避免目标应用只收到一个孤立的 Esc 抬起事件。
@@ -2497,6 +2569,27 @@ unsafe extern "system" fn low_level_keyboard_proc(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ask_alt_requires_a_fresh_press_and_only_consumes_its_own_keys() {
+        let mut latch = super::AskAltLatch::default();
+        assert_eq!(latch.key(0xA4, true, false, 0, false), (false, false));
+        // Initial Alt remains held when Alt+Space starts recording. Repeat and its release do not stop.
+        assert_eq!(latch.key(0xA4, true, false, 7, false), (false, false));
+        assert_eq!(latch.key(0xA4, false, true, 7, false), (false, false));
+        assert_eq!(latch.key(0xA5, true, false, 7, false), (false, false));
+        assert_eq!(latch.key(0xA4, true, false, 7, false), (true, true));
+        assert_eq!(latch.key(0xA4, true, false, 7, false), (true, false));
+        // Retaining the previous stop combination must not type a stray space or start a new ask.
+        assert_eq!(latch.key(0x20, true, false, 7, false), (true, false));
+        assert_eq!(latch.key(0xA4, false, true, 0, false), (true, false));
+        assert_eq!(latch.key(0x20, false, true, 0, false), (true, false));
+        // Outside a question recording, Alt and Space remain entirely untouched.
+        assert_eq!(latch.key(0xA4, true, false, 0, false), (false, false));
+        assert_eq!(latch.key(0x20, true, false, 0, false), (false, false));
+        latch.key(0xA4, false, true, 0, false);
+        // Existing bindings and additional held modifiers take priority.
+        assert_eq!(latch.key(0xA4, true, false, 8, true), (false, false));
+    }
     use super::{
         active_card_hotkeys, begin_hf_press, begin_ptt_press, card_hotkey_action_name,
         claim_ptt_release, complete_ptt_release, end_hf_press, escape_action_mode_name,
