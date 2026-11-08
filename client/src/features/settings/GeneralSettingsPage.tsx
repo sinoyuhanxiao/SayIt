@@ -14,6 +14,7 @@ import { drawBars, resetWaveform } from '@/services/waveform'
 import { Switch } from '@/components/ui/switch'
 import { Segmented } from '@/components/ui/segmented'
 import AppSection from './AppSection'
+import AskSettingsSection from './AskSettingsSection'
 import BackupSection from './BackupSection'
 import WebDavSection from './WebDavSection'
 import MicrophoneSection from './MicrophoneSection'
@@ -303,6 +304,8 @@ export default function GeneralSettingsPage() {
             </div>
           </CardContent>
         </Card>
+
+        <AskSettingsSection />
 
         {/* 麦克风排在「偏好设置」前面：它是录音链路的入口，选错设备什么都录不到；
             而下面那三个开关（提示音、静音外放、剪贴板保护）都是可选的锦上添花。 */}
