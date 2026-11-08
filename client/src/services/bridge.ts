@@ -13,6 +13,27 @@ import type { UpdateNotificationSnapshot } from '@/features/update/notificationT
 // Re-export for convenience
 export { invoke, listen, emit }
 
+export function syncAskWindow(snapshot: import('./ask').AskSnapshot) {
+  return invoke<void>('sync_ask_window', { snapshot })
+}
+
+export function setAskRecording(runId: number, active: boolean) {
+  return invoke<void>('set_ask_recording', { runId, active })
+}
+
+export function getAskSnapshot() {
+  return invoke<import('./ask').AskSnapshot>('get_ask_snapshot')
+}
+
+/** Visibility, not foreground focus: the answer panel may remain open above another app. */
+export function isAskWindowOpen(): Promise<boolean> {
+  return invoke<boolean>('plugin:window|is_visible', { label: 'ask' }).catch(() => false)
+}
+
+export function askWindowAction(runId: number, action: 'cancel' | 'new' | 'followup', question?: string) {
+  return invoke<void>('ask_window_action', { runId, action, question: question ?? null })
+}
+
 export function syncUpdateNotification(snapshot: UpdateNotificationSnapshot) {
   return invoke<void>('sync_update_notification', { snapshot })
 }
@@ -159,11 +180,11 @@ export function getProbeResult() {
 }
 
 /** 一次原生捕获同时返回录音目标上下文与插字探测结果。 */
-export function getRecordingContext(includeTextContext = false) {
+export function getRecordingContext(includeTextContext = false, askSelection = false) {
   return invoke<{
     appContext: Record<string, unknown>
     probe: Record<string, unknown>
-  }>('get_recording_context', { includeTextContext })
+  }>('get_recording_context', { includeTextContext, ...(askSelection ? { askSelection: true } : {}) })
 }
 
 export function getActiveAppContext() {
