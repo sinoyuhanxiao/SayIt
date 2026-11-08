@@ -1,0 +1,6 @@
+{
+  "identifier": "ask-window-events",
+  "description": "The question window receives ephemeral question snapshots. Actions and clipboard access use the application's native commands.",
+  "windows": ["ask"],
+  "permissions": ["core:event:default"]
+}
