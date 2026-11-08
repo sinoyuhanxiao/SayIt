@@ -96,6 +96,21 @@ fn is_strict_openai_host(api_url: &str) -> bool {
     })
 }
 
+/// GPT-5 Nano's official Chat Completions endpoint rejects legacy token/temperature fields.
+fn apply_nano_parameters(config: &AiProviderConfig, body: &mut serde_json::Value) {
+    if host_of(&config.api_url).as_deref() != Some("api.openai.com")
+        || !(config.model == "gpt-5-nano" || config.model.starts_with("gpt-5-nano-")) {
+        return;
+    }
+    if let Some(fields) = body.as_object_mut() {
+        if let Some(limit) = fields.remove("max_tokens") {
+            fields.insert("max_completion_tokens".into(), limit);
+        }
+        fields.remove("temperature");
+        fields.insert("reasoning_effort".into(), serde_json::json!("minimal"));
+    }
+}
+
 /// 把 overrides 合并进请求体。顶层同名字段**整体覆盖**，不做深合并 —— 深合并会让
 /// 两种风格的参数混出谁也说不清的结果。
 fn merge_overrides(body: &mut serde_json::Value, overrides: &serde_json::Value) {
@@ -355,15 +370,17 @@ pub async fn polish(
 
     // 思考参数不写在这里：由 send_chat_with_thinking_fallback 合并进来，
     // 这样被端点拒绝时它手上还有一份「干净的 body」可以直接重试。
-    let base_body = serde_json::json!({
+    let mut base_body = serde_json::json!({
         "model": config.model,
         "temperature": 0.2,
-        "max_tokens": 1024,
+        "max_tokens": if config.extra.get("task").and_then(|v| v.as_str()) == Some("ask") { 4096 } else { 1024 },
         "messages": [
             { "role": "system", "content": sys_prompt },
             { "role": "user", "content": user_content },
         ]
     });
+
+    apply_nano_parameters(config, &mut base_body);
 
     let start = Instant::now();
 
@@ -496,7 +513,7 @@ pub async fn test_connection(config: &AiProviderConfig) -> TestResult {
     // 曾经是 64。改成 512 是因为**强制思考的模型**（智谱 GLM-5.3 那一档）连最低强度
     // 也要先想一轮，64 个 token 基本全花在 reasoning 上、content 什么都不剩 ——
     // 那种「连上了但回复是空的」比报错更难判断。max_tokens 只是上限，不按它计费。
-    let base_body = serde_json::json!({
+    let mut base_body = serde_json::json!({
         "model": config.model,
         "temperature": 0,
         "max_tokens": 512,
@@ -505,6 +522,8 @@ pub async fn test_connection(config: &AiProviderConfig) -> TestResult {
             { "role": "user", "content": user_prompt }
         ]
     });
+
+    apply_nano_parameters(config, &mut base_body);
 
     let start = Instant::now();
 
@@ -708,6 +727,24 @@ mod tests {
             api_key: "sk-test".to_string(),
             model: model.to_string(),
             extra: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn official_nano_parameters_preserve_other_provider_requests() {
+        let original = serde_json::json!({"max_tokens": 4096, "temperature": 0.2, "messages": []});
+        for model in ["gpt-5-nano", "gpt-5-nano-2025-08-07"] {
+            let mut body = original.clone();
+            apply_nano_parameters(&config("openai_compat", "https://api.openai.com/v1", model), &mut body);
+            assert_eq!(body["max_completion_tokens"], 4096);
+            assert_eq!(body["reasoning_effort"], "minimal");
+            assert!(body.get("temperature").is_none());
+            assert!(body.get("max_tokens").is_none());
+        }
+        for (url, model) in [("https://example.com/v1", "gpt-5-nano"), ("https://api.openai.com/v1", "gpt-4o-mini")] {
+            let mut body = original.clone();
+            apply_nano_parameters(&config("openai_compat", url, model), &mut body);
+            assert_eq!(body, original);
         }
     }
 
