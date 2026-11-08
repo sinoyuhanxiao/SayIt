@@ -65,6 +65,8 @@ import {
 import { t } from '@/i18n'
 import { describeProviderError } from '@/lib/errorMessages'
 import { describeMicSource, micSourceChanged } from './micSourceReminder'
+import { AskSession, askContext } from '../ask'
+import { requestAskText } from '../askText'
 import {
   CONTEXT_SELECTION_EDIT_PROMPT,
   CONTEXT_SELECTION_EDIT_PROMPT_SETTING_KEY,
@@ -144,6 +146,15 @@ interface ResetToIdleOptions {
 
 
 export class RecorderOrchestrator {
+  private readonly ask = new AskSession(undefined, snapshot => {
+    if (this.askRunId === snapshot.runId || (this.state === 'idle' && !this.startRecordingLock)) {
+      this.overlayService.showError(t('ask.windowFailed'))
+    }
+  })
+  private askRunId = 0
+  private lastAskToggle = -Infinity
+  private askUnlisteners: Array<() => void> = []
+  private disposed = false
   private state: RecorderState = 'idle'
   /** 本次录音的运行期数据（模块 6）。字段的复位时机与原来逐字段写时完全一致。 */
   private readonly run = new RunState()
@@ -269,6 +280,10 @@ export class RecorderOrchestrator {
     aiSource?: HistoryRecord['aiSource']
     aiStatus?: HistoryRecord['aiStatus']
   }): Promise<void> {
+    if (this.askRunId === runId) {
+      this.ask.fail(runId, params.detail || params.title)
+      return
+    }
     const showCard = this.isRunCurrent(runId)
     if (showCard) {
       // 必须先认领 token，再显示卡片：Esc 的 dismiss_fallback 分支拿 activeFallbackToken
@@ -343,6 +358,11 @@ export class RecorderOrchestrator {
   /** 幂等结束指定代次；所有清理都带 runId 条件，绝不清除随后创建的新代次。 */
   private finishRun(runId: number) {
     if (runId === 0) return
+    if (this.askRunId === runId) {
+      void bridge.setAskRecording(runId, false).catch(() => {})
+      this.ask.fail(runId)
+      this.askRunId = 0
+    }
     this.history.clearPendingFor(runId)
     if (this.timedOutProcessingContext?.runId === runId) {
       this.timedOutProcessingContext = null
@@ -440,6 +460,38 @@ export class RecorderOrchestrator {
   async init() {
     if (this.initialized) return
     this.initialized = true
+    this.disposed = false
+
+    const subscribeAsk = (name: string, handler: (event: unknown) => void) => {
+      void bridge.listen(name, handler).then(unlisten => {
+        if (this.disposed) unlisten()
+        else this.askUnlisteners.push(unlisten)
+      }).catch(() => {})
+    }
+    subscribeAsk('toggle-ask', () => { void this.toggleAsk() })
+    subscribeAsk('stop-ask-recording', event => {
+      const runId = (event as { payload?: { runId?: number } })?.payload?.runId
+      if (!runId || runId !== this.askRunId || runId !== this.activeRunId) return
+      if (this.startRecordingLock) this.run.pendingStopWhileStarting = true
+      else if (this.state === 'recording') void this.stopRecording()
+    })
+    subscribeAsk('ask-action', event => {
+      const payload = (event as { payload?: { action?: string; runId?: number; question?: string } })?.payload
+      if (!payload || payload.runId !== this.ask.activeRunId) return
+      if (payload.action === 'new') {
+        if (this.state === 'idle' && !this.startRecordingLock) void this.toggleAsk(true)
+      } else if (payload.action === 'followup') {
+        if (!this.disposed && this.state === 'idle' && !this.startRecordingLock && !this.textInsertionInFlight) {
+          void this.ask.followUp(payload.runId!, payload.question ?? '', requestAskText)
+        }
+      } else if (payload.action === 'cancel') {
+        const runId = payload.runId
+        this.ask.cancel(runId)
+        if (runId !== this.askRunId) return
+        if (this.state === 'processing') this.cancelProcessing(runId)
+        else void this.cancelRecording(runId)
+      }
+    })
 
     startInsertionTargetTracking()
     await this.refreshRuntimeSettings()
@@ -606,6 +658,10 @@ export class RecorderOrchestrator {
   }
 
   cleanup() {
+    this.disposed = true
+    this.askUnlisteners.splice(0).forEach(unlisten => unlisten())
+    this.ask.cancel(this.ask.activeRunId)
+    if (this.askRunId) void bridge.setAskRecording(this.askRunId, false).catch(() => {})
     this.clearProcessingTimeout()
     this.micLevel.clearAutoCancelTimer()
     this.micLevel.invalidateProbes()
@@ -788,6 +844,7 @@ export class RecorderOrchestrator {
     }
     addRuntimeEvent('info', 'recorder', 'State changed', { from: this.state, to })
     this.state = to
+    if (this.askRunId) void bridge.setAskRecording(this.askRunId, to === 'recording').catch(() => {})
     this.onStateChange?.(to)
     return true
   }
@@ -935,6 +992,7 @@ export class RecorderOrchestrator {
     }
 
     const canceledRunId = this.activeRunId
+    if (this.askRunId === canceledRunId) this.ask.cancel(canceledRunId)
     // 在任何 await 之前离开 recording 并让 run 失效。这样同时到达的 PTT up 不会
     // 再进入正常 stopRecording，Provider 的迟到 partial/error 也会被 run guard 丢弃。
     if (!this.transition('processing')) return
@@ -985,6 +1043,7 @@ export class RecorderOrchestrator {
     }
 
     const canceledRunId = this.activeRunId
+    if (this.askRunId === canceledRunId) this.ask.cancel(canceledRunId)
     const historyArtifact = this.history.getPending()
     this.clearProcessingTimeout()
     // 用户明确按了 Esc：这一代的音频存档和历史都该消失。这是唯一允许丢弃录音的入口。
@@ -1027,6 +1086,18 @@ export class RecorderOrchestrator {
       onASR: (result) => {
         if (this.state !== 'processing') return
         if (this.run.finalHandledInCurrentRun) return
+        if (this.askRunId === this.activeRunId && this.askRunId !== 0) {
+          this.ask.update(this.askRunId, { question: result.text })
+          if (!result.text.trim()) {
+            this.run.finalHandledInCurrentRun = true
+            this.ask.fail(this.askRunId, t('ask.noSpeech'))
+            this.provider.cancel()
+            this.finishRun(this.activeRunId)
+            this.resetToIdle()
+            if (this.provider.mode === 'server') this.ensureConnection()
+          }
+          return
+        }
         if (result.text && result.text.trim() !== '') return
 
         const runId = this.activeRunId
@@ -1218,6 +1289,7 @@ export class RecorderOrchestrator {
           return
         }
         const friendlyFailure = describeProviderError(msg)
+        if (this.askRunId === runId) this.ask.fail(runId, friendlyFailure.message)
         addRuntimeEvent('error', 'backend', msg)
         this.clearProcessingTimeout()
         this.run.processingCancelable = false
@@ -1241,11 +1313,11 @@ export class RecorderOrchestrator {
         )
         // 错误在录音进行中到达时还没走过 stopRecording，音频尚未开始落盘 —— 在这里补上，
         // 否则「说到一半连接断了」这段语音谁都没保存。
-        if (audioDur >= 0.5 && this.run.recordedChunks.length > 0) {
+        if (this.askRunId !== runId && audioDur >= 0.5 && this.run.recordedChunks.length > 0) {
           this.audioArchive.ensure(runId, this.run.recordedChunks.slice())
         }
         void (async () => {
-          if (audioDur >= 0.5) {
+          if (audioDur >= 0.5 && this.askRunId !== runId) {
             // 供应商/后端给的原话（额度、资源未开通、连接被断都在这里）。
             //
             // ⚠️ 这里以前按 failedWhileRecording 分叉：只有**录音中**到达的错误才提示，
@@ -1391,9 +1463,9 @@ export class RecorderOrchestrator {
    * （调用方是 `void this.startRecording()`），锁永远不释放，之后每次按热键都被当成
    * 「正在启动」忽略 —— 热键全部失灵直到重启，悬浮窗停在「等待中」，日志里一个字都没有。
    */
-  private async startRecording() {
+  private async startRecording(purpose: 'dictation' | 'ask' = 'dictation', continuation = false) {
     try {
-      await this.startRecordingInner()
+      await this.startRecordingInner(purpose, continuation)
     } catch (error) {
       const runId = this.activeRunId
       addRuntimeEvent('error', 'recorder', 'Failed to start recording', {
@@ -1413,7 +1485,29 @@ export class RecorderOrchestrator {
     }
   }
 
-  private async startRecordingInner() {
+  /** Dedicated toggle, sharing the microphone lock and lifecycle with ordinary dictation. */
+  async toggleAsk(continuation?: boolean) {
+    if (!await getSetting('ask.enabled', false).catch(() => false)) return
+    if (this.disposed || this.pttSuppressed || Date.now() - this.lastAskToggle < 250) return
+    this.lastAskToggle = Date.now()
+    if (this.askRunId && this.startRecordingLock) {
+      this.run.pendingStopWhileStarting = true
+      return
+    }
+    if (this.askRunId && this.state === 'recording') {
+      await this.stopRecording()
+      return
+    }
+    if (this.state !== 'idle' || this.startRecordingLock || this.textInsertionInFlight || this.ask.busy) return
+    // The button explicitly continues even though its native action hides the panel first.
+    // The global shortcut follows whether the panel is open, regardless of foreground focus.
+    const continueConversation = continuation ?? (this.ask.current !== null && await bridge.isAskWindowOpen())
+    if (this.disposed || this.state !== 'idle' || this.startRecordingLock || this.textInsertionInFlight || this.ask.busy) return
+    this.handsFreeMode = true
+    await this.startRecording('ask', continueConversation)
+  }
+
+  private async startRecordingInner(purpose: 'dictation' | 'ask', continuation = false) {
     if (
       this.state !== 'idle'
       || this.startRecordingLock
@@ -1449,6 +1543,10 @@ export class RecorderOrchestrator {
 
     const runId = ++this.runSequence
     this.activeRunId = runId
+    if (purpose === 'ask') {
+      this.askRunId = runId
+      this.ask.begin(runId, continuation)
+    }
     this.activeFallbackToken = 0
     this.startRecordingLock = true
     this.run.pendingStopWhileStarting = false
@@ -1469,8 +1567,10 @@ export class RecorderOrchestrator {
     try {
       // AI is the only consumer of editor text. If cleanup is off, do not read the text even when
       // the preference remains enabled, so the privacy boundary matches actual behavior.
-      const includeTextContext = this.settings.contextAwareWriting && this.settings.aiEnabled
-      const recordingContext = await bridge.getRecordingContext(includeTextContext)
+      const includeTextContext = purpose === 'ask' ? !continuation : (this.settings.contextAwareWriting && this.settings.aiEnabled)
+      const recordingContext = purpose === 'ask' && !continuation
+        ? await bridge.getRecordingContext(true, true)
+        : await bridge.getRecordingContext(includeTextContext)
       activeAppContext = recordingContext.appContext as unknown as ActiveAppContext
       this.run.cachedProbeResult = recordingContext.probe as unknown as ProbeResult
       addRuntimeEvent('info', 'recorder', 'Insertion probe cached at recording start', {
@@ -1485,7 +1585,16 @@ export class RecorderOrchestrator {
       activeAppContext = null
       this.run.cachedProbeResult = null
     }
-    const textContext = usableTextContext(activeAppContext?.textContext)
+    if (purpose === 'ask' && !continuation) this.ask.update(runId, askContext(activeAppContext))
+    // Asking sends only the explicit selection, not surrounding paragraphs.
+    const capturedTextContext = purpose === 'ask' && continuation
+      ? { source: 'ask_conversation', selectedText: this.ask.current?.selectedText ?? '', textBefore: '', textAfter: '', selectionTruncated: false }
+      : usableTextContext(activeAppContext?.textContext)
+    const textContext = purpose === 'ask'
+      ? capturedTextContext?.selectedText
+        ? { ...capturedTextContext, textBefore: '', textAfter: '' }
+        : null
+      : capturedTextContext
     if (activeAppContext) {
       if (textContext) activeAppContext.textContext = textContext
       else delete activeAppContext.textContext
@@ -1501,7 +1610,13 @@ export class RecorderOrchestrator {
       hotwords: this.settings.hotwords,
       injectHotwords: this.settings.injectHotwords,
     })
-    if (textContext) {
+    if (purpose === 'ask') {
+      this.run.currentPromptResolution = {
+        ...this.run.currentPromptResolution,
+        systemPrompt: this.ask.prompt,
+        summary: 'Voice question',
+      }
+    } else if (textContext) {
       this.run.currentPromptResolution = {
         ...this.run.currentPromptResolution,
         systemPrompt: withContextAwareInstructions(
@@ -1578,8 +1693,8 @@ export class RecorderOrchestrator {
     // 门槛从 60 改成了 0），这一条的原因也不能跟着变。
     this.run.currentAiConfig = {
       workMode: this.provider.mode,
-      aiEnabled: this.settings.aiEnabled,
-      aiMinDurationSec: this.settings.aiMinDurationSec,
+      aiEnabled: purpose === 'ask' || this.settings.aiEnabled,
+      aiMinDurationSec: purpose === 'ask' ? 0 : this.settings.aiMinDurationSec,
       serverAiSource: getRuntimeServerAiSource(),
     }
     this.run.currentOperationId = `${runId}-${Date.now().toString(36)}`
@@ -1588,18 +1703,19 @@ export class RecorderOrchestrator {
     // 读设置放进下面和建连、开麦并行的那一组里，不在这里 await：这一段处在
     // startRecordingLock 置位之后、外层兜底之外，多一个 await 就多一处让热键卡死的
     // 可能，开始录音也会慢一拍。没有选区时它不读设置，直接返回 null。
-    const selectionAiConfigPromise = this.settings.aiEnabled
+    const selectionAiConfigPromise = purpose !== 'ask' && this.settings.aiEnabled
       ? loadSelectionAiConfig(textContext)
       : Promise.resolve(null)
 
     const promptOpts = this.run.currentPromptResolution
       ? {
         runId,
+        ...(purpose === 'ask' ? { purpose: 'ask' as const } : {}),
         operationId: this.run.currentOperationId,
         aiConfig: this.run.currentAiConfig,
-        systemPrompt: this.settings.aiEnabled ? this.run.currentPromptResolution.systemPrompt : undefined,
-        disableAi: !this.settings.aiEnabled,
-        aiMinDurationSec: this.settings.aiMinDurationSec,
+        systemPrompt: purpose === 'ask' || this.settings.aiEnabled ? this.run.currentPromptResolution.systemPrompt : undefined,
+        disableAi: purpose !== 'ask' && !this.settings.aiEnabled,
+        aiMinDurationSec: purpose === 'ask' ? 0 : this.settings.aiMinDurationSec,
         clientMeta: this.clientRuntimeInfo,
         appContext: activeAppContext,
         textContext,
@@ -1611,8 +1727,9 @@ export class RecorderOrchestrator {
         runId,
         operationId: this.run.currentOperationId,
         aiConfig: this.run.currentAiConfig,
-        disableAi: !this.settings.aiEnabled,
-        aiMinDurationSec: this.settings.aiMinDurationSec,
+        ...(purpose === 'ask' ? { purpose: 'ask' as const } : {}),
+        disableAi: purpose !== 'ask' && !this.settings.aiEnabled,
+        aiMinDurationSec: purpose === 'ask' ? 0 : this.settings.aiMinDurationSec,
         clientMeta: this.clientRuntimeInfo,
         appContext: activeAppContext,
         textContext,
@@ -1776,6 +1893,7 @@ export class RecorderOrchestrator {
     }
 
     const runId = this.activeRunId
+    if (this.askRunId === runId) void bridge.setAskRecording(runId, false).catch(() => {})
     this.micLevel.clearAutoCancelTimer()
 
     // Wait for capture setup to complete (getUserMedia + AudioWorklet can take time)
@@ -1806,6 +1924,7 @@ export class RecorderOrchestrator {
     const pttHoldMs = elapsedSecFromPerf(this.run.recordStartPerf) * 1000
     const wallTimeSec = pttHoldMs / 1000
     this.run.wallTimeAtStopSec = wallTimeSec
+    if (this.askRunId === runId) this.ask.update(runId, { status: 'processing' })
     console.log('[ptt-diag] stopRecording', {
       audioSentSamples: this.run.audioSentSamples,
       audioDurSec: audioDur.toFixed(2),
@@ -1827,6 +1946,7 @@ export class RecorderOrchestrator {
       // 不再丢弃音频，保留以便用户回放和重新识别
     }
     if (audioDur < 0.5) {
+      if (this.askRunId === runId) this.ask.fail(runId, t('ask.noSpeech'))
       addRuntimeEvent('info', 'recorder', 'Recording shorter than 0.5s; canceled provider and discarded audio')
       this.provider.cancel()
       this.finishRun(runId)
@@ -1884,7 +2004,7 @@ export class RecorderOrchestrator {
     this.run.processingCancelable = true
 
     // 音频先落盘，不等识别结果。此后无论超时、断连、还是进程被杀，这段录音都还在磁盘上。
-    this.audioArchive.begin(runId, this.run.recordedChunks.slice())
+    if (this.askRunId !== runId) this.audioArchive.begin(runId, this.run.recordedChunks.slice())
 
     if (!stopAccepted) {
       // 请求根本没送出去（server 模式连接已断、或 provider 会话已失效）。以前这里照样
@@ -1901,7 +2021,9 @@ export class RecorderOrchestrator {
       return
     }
 
-    const processingTimeoutMs = this.computeProcessingTimeoutMs(audioDur)
+    const processingTimeoutMs = this.askRunId === runId
+      ? Math.max(90_000, this.computeProcessingTimeoutMs(audioDur))
+      : this.computeProcessingTimeoutMs(audioDur)
     addRuntimeEvent('info', 'recorder', 'Entered processing', {
       audioSec: audioDur,
       timeoutMs: processingTimeoutMs,
@@ -1914,6 +2036,14 @@ export class RecorderOrchestrator {
     let insertionExtensions = 0
     const onProcessingTimeout = () => {
       if (this.state !== 'processing' || !this.isRunCurrent(runId)) return
+      if (this.askRunId === runId) {
+        this.ask.fail(runId, t('ask.timeout'))
+        this.provider.cancel()
+        this.finishRun(runId)
+        this.resetToIdle()
+        if (this.provider.mode === 'server') this.ensureConnection()
+        return
+      }
       if (this.textInsertionInFlight) {
         if (insertionExtensions < MAX_INSERTION_TIMEOUT_EXTENSIONS) {
           insertionExtensions++
@@ -2188,6 +2318,12 @@ export class RecorderOrchestrator {
   ) {
     const runId = context.runId
     if (!this.isRunCurrent(runId)) return
+    if (this.askRunId === runId) {
+      this.ask.finish(runId, result)
+      this.finishRun(runId)
+      this.resetToIdle()
+      return
+    }
 
     // llmText === asrText 说明这段没经过 AI 整理（极速模式，或后端未跑 LLM 直接回 asrText）。
     // 此时文本仍是纯 ASR，「格式规范」由我们兜底；AI 整理过的文本则把格式交给 AI，只做文本替换。
