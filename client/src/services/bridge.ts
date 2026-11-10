@@ -25,12 +25,20 @@ export function getAskSnapshot() {
   return invoke<import('./ask').AskSnapshot>('get_ask_snapshot')
 }
 
+export function captureAskScreenshot() {
+  return invoke<string>('capture_ask_screenshot')
+}
+
+export function getOverlayPointerState() {
+  return invoke<{ x: number; y: number } | null>('get_overlay_pointer_state')
+}
+
 /** Visibility, not foreground focus: the answer panel may remain open above another app. */
 export function isAskWindowOpen(): Promise<boolean> {
   return invoke<boolean>('plugin:window|is_visible', { label: 'ask' }).catch(() => false)
 }
 
-export function askWindowAction(runId: number, action: 'cancel' | 'new' | 'followup', question?: string) {
+export function askWindowAction(runId: number, action: 'cancel' | 'new' | 'followup' | 'removeScreenshot', question?: string) {
   return invoke<void>('ask_window_action', { runId, action, question: question ?? null })
 }
 

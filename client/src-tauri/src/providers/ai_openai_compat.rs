@@ -354,6 +354,7 @@ pub async fn polish(
     config: &AiProviderConfig,
     system_prompt: Option<&str>,
     text_context: Option<&TextContext>,
+    image_data_url: Option<&str>,
 ) -> Result<AiResult, String> {
     if text.trim().is_empty() {
         return Ok(AiResult {
@@ -367,6 +368,23 @@ pub async fn polish(
 
     let sys_prompt = system_prompt.unwrap_or("你是语音转文本的校对助手。");
     let user_content = wrap_user_text(text, text_context);
+    let user_message = if let Some(image_data_url) = image_data_url {
+        if !(image_data_url.starts_with("data:image/png;base64,")
+            || image_data_url.starts_with("data:image/jpeg;base64,")
+            || image_data_url.starts_with("data:image/webp;base64,"))
+        {
+            return Err("Unsupported image format for AI question".into());
+        }
+        if image_data_url.len() > 24 * 1024 * 1024 {
+            return Err("Question screenshot is too large".into());
+        }
+        serde_json::json!([
+            { "type": "text", "text": user_content },
+            { "type": "image_url", "image_url": { "url": image_data_url } },
+        ])
+    } else {
+        serde_json::Value::String(user_content)
+    };
 
     // 思考参数不写在这里：由 send_chat_with_thinking_fallback 合并进来，
     // 这样被端点拒绝时它手上还有一份「干净的 body」可以直接重试。
@@ -376,7 +394,7 @@ pub async fn polish(
         "max_tokens": if config.extra.get("task").and_then(|v| v.as_str()) == Some("ask") { 4096 } else { 1024 },
         "messages": [
             { "role": "system", "content": sys_prompt },
-            { "role": "user", "content": user_content },
+            { "role": "user", "content": user_message },
         ]
     });
 

@@ -48,6 +48,17 @@ pub fn set_ask_recording(token: u64, active: bool) {
     }
 }
 
+/// Windows global-shortcut callbacks report generic Alt. Ask shortcuts intentionally only
+/// respond to physical Left Alt so Right Alt remains the user's direct-dictation trigger.
+pub fn is_left_alt_pressed() -> bool {
+    #[cfg(windows)]
+    unsafe {
+        return windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0xA4) < 0;
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 #[derive(Default)]
 #[cfg_attr(not(windows), allow(dead_code))]
 struct AskAltLatch { down: bool, consumed: bool, space: bool }

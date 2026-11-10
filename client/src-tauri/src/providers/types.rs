@@ -76,6 +76,8 @@ pub struct CloudPolishRequest {
     pub text: String,
     pub ai_config: AiProviderConfig,
     #[serde(default)]
+    pub image_data_url: Option<String>,
+    #[serde(default)]
     pub system_prompt: Option<String>,
     #[serde(default)]
     pub text_context: Option<TextContext>,

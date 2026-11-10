@@ -7,6 +7,7 @@ pub mod export;
 pub mod paste;
 pub mod permissions;
 pub mod shortcuts;
+pub mod screenshot;
 pub mod storage;
 pub mod system;
 pub mod tray;

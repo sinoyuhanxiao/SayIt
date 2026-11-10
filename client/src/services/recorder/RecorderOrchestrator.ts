@@ -356,11 +356,11 @@ export class RecorderOrchestrator {
   }
 
   /** 幂等结束指定代次；所有清理都带 runId 条件，绝不清除随后创建的新代次。 */
-  private finishRun(runId: number) {
+  private finishRun(runId: number, preserveAskSession = false) {
     if (runId === 0) return
     if (this.askRunId === runId) {
       void bridge.setAskRecording(runId, false).catch(() => {})
-      this.ask.fail(runId)
+      if (!preserveAskSession) this.ask.fail(runId)
       this.askRunId = 0
     }
     this.history.clearPendingFor(runId)
@@ -469,6 +469,9 @@ export class RecorderOrchestrator {
       }).catch(() => {})
     }
     subscribeAsk('toggle-ask', () => { void this.toggleAsk() })
+    subscribeAsk('capture-ask-screenshot', () => {
+      void bridge.captureAskScreenshot().then(dataUrl => this.ask.beginScreenshot(dataUrl)).catch(() => this.ask.captureFailed())
+    })
     subscribeAsk('stop-ask-recording', event => {
       const runId = (event as { payload?: { runId?: number } })?.payload?.runId
       if (!runId || runId !== this.askRunId || runId !== this.activeRunId) return
@@ -484,6 +487,8 @@ export class RecorderOrchestrator {
         if (!this.disposed && this.state === 'idle' && !this.startRecordingLock && !this.textInsertionInFlight) {
           void this.ask.followUp(payload.runId!, payload.question ?? '', requestAskText)
         }
+      } else if (payload.action === 'removeScreenshot') {
+        this.ask.removeScreenshot()
       } else if (payload.action === 'cancel') {
         const runId = payload.runId
         this.ask.cancel(runId)
@@ -2319,6 +2324,12 @@ export class RecorderOrchestrator {
     const runId = context.runId
     if (!this.isRunCurrent(runId)) return
     if (this.askRunId === runId) {
+      if (this.ask.current?.screenshotDataUrl) {
+        void this.ask.answerVoiceQuestion(runId, result.asrText, requestAskText)
+        this.finishRun(runId, true)
+        this.resetToIdle()
+        return
+      }
       this.ask.finish(runId, result)
       this.finishRun(runId)
       this.resetToIdle()

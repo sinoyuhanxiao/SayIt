@@ -106,7 +106,7 @@ function AskWindow() {
     }
   }
 
-  const act = async (action: 'cancel' | 'new') => {
+  const act = async (action: 'cancel' | 'new' | 'removeScreenshot') => {
     try {
       if (!preview) await askWindowAction(snapshot.runId, action)
     } catch {
@@ -140,6 +140,18 @@ function AskWindow() {
         </button>
       </header>
       <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-5">
+        {snapshot.screenshotDataUrl ? (
+          <section className="rounded-xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-700 dark:bg-slate-900">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <h2 className="text-xs font-semibold text-slate-600 dark:text-slate-300">{t('ask.screenshot')}</h2>
+              <button type="button" onClick={() => void act('removeScreenshot')} disabled={busy}
+                className="rounded-md p-1 text-slate-500 hover:bg-slate-200 disabled:opacity-40 dark:hover:bg-slate-800">
+                <X className="h-4 w-4" /><span className="sr-only">{t('ask.removeScreenshot')}</span>
+              </button>
+            </div>
+            <img src={snapshot.screenshotDataUrl} alt={t('ask.screenshot')} className="max-h-52 w-full rounded-lg object-contain" />
+          </section>
+        ) : null}
         {snapshot.selectedText ? (
           <details className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm dark:border-slate-700 dark:bg-slate-900">
             <summary className="cursor-pointer font-medium">{t('ask.reference')}</summary>
@@ -147,9 +159,9 @@ function AskWindow() {
               {snapshot.selectedText}
             </p>
           </details>
-        ) : (
+        ) : !snapshot.screenshotDataUrl ? (
           <p className="text-xs text-slate-500">{snapshot.contextWarning || t('ask.noSelection')}</p>
-        )}
+        ) : null}
         {(snapshot.turns ?? []).map((turn, index) => (
           <article key={index} className="space-y-3 border-b border-slate-100 pb-5 dark:border-slate-800">
             <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-500">{t('ask.question')}</h2>
@@ -158,6 +170,7 @@ function AskWindow() {
             <p className="whitespace-pre-wrap break-words text-sm leading-7">{turn.answer}</p>
           </article>
         ))}
+        {(snapshot.question || busy || snapshot.answer) ? <>
         <section aria-label={t('ask.question')}>
           <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">{t('ask.question')}</h2>
           <p className="whitespace-pre-wrap break-words rounded-xl bg-blue-50 px-4 py-3 text-sm leading-relaxed dark:bg-blue-950">
@@ -179,10 +192,14 @@ function AskWindow() {
             <p className="whitespace-pre-wrap break-words text-sm leading-7">{snapshot.answer}</p>
           )}
         </section>
+        </> : null}
         {actionError ? (
           <p role="alert" className="text-sm text-red-600">
             {t('ask.actionFailed')}
           </p>
+        ) : null}
+        {snapshot.error && snapshot.status !== 'error' ? (
+          <p role="alert" className="text-sm text-red-600 dark:text-red-400">{snapshot.error}</p>
         ) : null}
         <div ref={conversationEnd} />
       </div>

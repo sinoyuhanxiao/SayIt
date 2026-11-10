@@ -245,6 +245,52 @@
   clip-path: inset(0);
 }
 
+.overlay-pointer-ripple {
+  pointer-events: none;
+  opacity: 0;
+  background: radial-gradient(
+    ellipse 54px 30px at var(--overlay-pointer-x, 50%) var(--overlay-pointer-y, 50%),
+    color-mix(in srgb, var(--overlay-text) 22%, transparent),
+    transparent 100%
+  );
+  transition: opacity 120ms ease-out;
+}
+
+.overlay-pointer-track {
+  pointer-events: none;
+  left: 0;
+  width: 100%;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    transparent 10%,
+    color-mix(in srgb, var(--overlay-text) 18%, transparent) 10%,
+    color-mix(in srgb, var(--overlay-text) 18%, transparent) 90%,
+    transparent 90%,
+    transparent 100%
+  );
+  opacity: 0;
+  transition: opacity 120ms ease-out;
+}
+
+.overlay-pointer-track::after {
+  position: absolute;
+  top: 50%;
+  left: var(--overlay-pointer-x, 50%);
+  width: 7px;
+  height: 7px;
+  border-radius: 9999px;
+  background: var(--overlay-text);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--overlay-text) 70%, transparent);
+  content: '';
+  transform: translate(-50%, -50%);
+}
+
+[data-pointer-active='true'] > .overlay-pointer-ripple,
+[data-pointer-active='true'] > .overlay-pointer-track {
+  opacity: 1;
+}
+
 /* 流式字幕的文字光标：只改透明度、不缩放不移动，柔和的打字机竖线 */
 @keyframes caret-blink {
 

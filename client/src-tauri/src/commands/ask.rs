@@ -48,6 +48,8 @@ pub struct AskSnapshot {
     error: String,
     locale: String,
     #[serde(default)]
+    screenshot_data_url: Option<String>,
+    #[serde(default)]
     turns: Vec<AskTurn>,
 }
 
@@ -154,7 +156,7 @@ pub fn ask_window_action(
     action: String,
     question: Option<String>,
 ) -> Result<(), String> {
-    if window.label() != LABEL || !matches!(action.as_str(), "cancel" | "new" | "followup") {
+    if window.label() != LABEL || !matches!(action.as_str(), "cancel" | "new" | "followup" | "removeScreenshot") {
         return Err("Invalid question window action".into());
     }
     if state.0.lock().map_err(|e| e.to_string())?.run_id != run_id {
@@ -165,7 +167,7 @@ pub fn ask_window_action(
         if text.is_empty() || text.chars().count() > 4000 {
             return Err("Question must contain 1 to 4000 characters".into());
         }
-    } else {
+    } else if action == "cancel" || action == "new" {
         hide_ask_window(&window)?;
     }
     app.emit_to(

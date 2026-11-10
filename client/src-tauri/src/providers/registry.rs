@@ -25,10 +25,14 @@ pub async fn cloud_polish(request: CloudPolishRequest) -> Result<AiResult, Strin
                 config,
                 request.system_prompt.as_deref(),
                 request.text_context.as_ref(),
+                request.image_data_url.as_deref(),
             )
             .await
         }
         "ollama" => {
+            if request.image_data_url.is_some() {
+                return Err("This AI provider path does not support image input".into());
+            }
             ai_ollama::polish(
                 &request.text,
                 config,

@@ -816,6 +816,8 @@ fn main() {
             commands::ask::get_ask_snapshot,
             commands::ask::ask_window_action,
             commands::ask::set_ask_recording,
+            commands::screenshot::capture_ask_screenshot,
+            commands::screenshot::get_overlay_pointer_state,
             // Store
             commands::storage::store_get,
             commands::storage::store_set,

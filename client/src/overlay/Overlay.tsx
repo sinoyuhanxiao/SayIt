@@ -116,6 +116,7 @@ export default function Overlay() {
   const [micSourceMode, setMicSourceMode] = useState<'auto' | 'fixed' | null>(null)
   const [micSourceLabel, setMicSourceLabel] = useState('')
   const rootRef = useRef<HTMLDivElement | null>(null)
+  const voicePillRef = useRef<HTMLDivElement | null>(null)
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   /**
    * 给 Ctrl+C 用的当前卡片快照。
@@ -378,6 +379,43 @@ export default function Overlay() {
 
   const recordingPhase = state === 'waiting' || state === 'listening'
   const visuallyListening = state === 'listening' && recordingVisualPhase === 'listening'
+
+  useEffect(() => {
+    const pill = voicePillRef.current
+    if (!pill) return
+    let active = true
+    let polling = false
+    const updatePointer = async () => {
+      if (!active || polling) return
+      polling = true
+      try {
+        const position = await bridge.getOverlayPointerState()
+        if (!active) return
+        if (!position) {
+          pill.dataset.pointerActive = 'false'
+          return
+        }
+        pill.style.setProperty('--overlay-pointer-x', `${Math.max(0, Math.min(1, position.x)) * 100}%`)
+        pill.style.setProperty('--overlay-pointer-y', `${Math.max(0, Math.min(1, position.y)) * 100}%`)
+        pill.dataset.pointerActive = 'true'
+      } catch {
+        pill.dataset.pointerActive = 'false'
+      } finally {
+        polling = false
+      }
+    }
+
+    pill.dataset.pointerActive = 'false'
+    if (!recordingPhase) return () => { active = false }
+    void updatePointer()
+    const timer = window.setInterval(() => { void updatePointer() }, 70)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+      pill.dataset.pointerActive = 'false'
+    }
+  }, [recordingPhase])
+
   const showStreamingBubble = visuallyListening && (streamingOn || streamingText.trim().length > 0)
   const hasStreamingText = streamingText.trim().length > 0
   const showMicSourceHint = Boolean(
@@ -697,6 +735,7 @@ export default function Overlay() {
               传到波形上（bars 的 min-w-0），胶囊本身始终保持完整的胶囊形状。
               用 100vw 而不是 max-w-full：父层宽度也是按内容算的，撑不出约束。 */}
           <div
+            ref={voicePillRef}
             className={`relative flex max-w-[calc(100vw-8px)] items-center overflow-hidden whitespace-nowrap rounded-full px-4 py-2${recordingPhase && recordingVisualPhase === 'preparing' ? ' overlay-pill-recording-waiting' : ''}${recordingPhase && recordingVisualPhase === 'listening' ? ' overlay-pill-recording-listening' : ''}`}
             style={{ minHeight: '38px' }}
           >
@@ -709,6 +748,12 @@ export default function Overlay() {
                 borderColor: 'var(--overlay-border)',
               }}
             />
+            {recordingPhase && (
+              <>
+                <span className="overlay-pointer-ripple absolute inset-0 z-[1] rounded-full" aria-hidden />
+                <span className="overlay-pointer-track absolute bottom-[2px] left-[10%] z-[2] h-[2px] w-[80%] rounded-full" aria-hidden />
+              </>
+            )}
             {recordingPhase ? (
               <div
                 className="overlay-recording-stage relative z-[1] min-w-0"

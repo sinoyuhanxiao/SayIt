@@ -155,6 +155,8 @@ pub fn register_all_global_shortcuts(app: &AppHandle, storage: &Storage) {
     } else {
         match gs.on_shortcut(ask_key, |app, _, event| {
             if event.state == ShortcutState::Pressed {
+                #[cfg(windows)]
+                if !crate::keyboard::is_left_alt_pressed() { return; }
                 let _ = app.emit_to("main", "toggle-ask", ());
             }
         }) {
@@ -166,6 +168,20 @@ pub fn register_all_global_shortcuts(app: &AppHandle, storage: &Storage) {
         }
     };
     let _ = storage.set("ask.shortcutConflict", &serde_json::json!(ask_error));
+
+    // The screenshot chord is deliberately distinct from Ask voice (Left Alt+Space).
+    // Refuse to take over an existing user's shortcut binding.
+    const ASK_SCREENSHOT_SHORTCUT: &str = "Control+Alt+Space";
+    #[cfg(windows)]
+    if ask_enabled && !gs.is_registered(ASK_SCREENSHOT_SHORTCUT) {
+        if let Err(error) = gs.on_shortcut(ASK_SCREENSHOT_SHORTCUT, |app, _, event| {
+            if event.state == ShortcutState::Pressed && crate::keyboard::is_left_alt_pressed() {
+                let _ = app.emit_to("main", "capture-ask-screenshot", ());
+            }
+        }) {
+            log::warn!("Could not register Ask screenshot shortcut: {}", error);
+        }
+    }
 
     #[cfg(target_os = "macos")]
     crate::keyboard::set_tap_combos(tap_combos);
